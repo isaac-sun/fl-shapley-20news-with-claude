@@ -1,0 +1,51 @@
+# =============================================================================
+# Federated Learning + Shapley Value Experiment Configuration
+# 20 Newsgroups | TF-IDF + Logistic Regression (SGD)
+# =============================================================================
+
+# ----- Data -----
+num_classes: 20
+max_tfidf_features: 10000     # Maximum TF-IDF vocabulary size
+test_size: 0.15               # Fraction for final test set
+val_size: 0.15                # Fraction for Shapley / tuning validation set
+
+# ----- Client Partition -----
+num_clients: 10
+dirichlet_alpha: 0.1          # Concentration parameter; smaller => more non-IID
+
+# ----- Federated Learning -----
+num_rounds: 20                # Total communication rounds
+client_fraction: 0.5          # Fraction of clients selected per round
+local_epochs: 3               # Local SGD epochs per round
+learning_rate: 0.01           # Constant SGD learning rate
+batch_size: 32                # Mini-batch size for local training
+random_seed: 42
+
+# ----- Shapley Value Estimation -----
+# Players  : class-specific data subsets owned by a client
+# Coalition: a subset of those classes
+# Utility  : validation accuracy after fine-tuning global model on coalition data
+# Method   : Monte Carlo permutation sampling with coalition caching
+shapley_num_permutations: 10  # Monte Carlo samples (increase for more accuracy)
+shapley_local_epochs: 1       # Epochs used inside Shapley utility fn (keep small for speed)
+shapley_every_n_rounds: 1     # Compute Shapley every N rounds (1 = every round)
+
+# ----- Attack Settings -----
+# Set attack_type to one of: "clean" | "freerider" | "poisoning"
+attack_type: "clean"
+
+# Free-rider attack
+free_rider_ratio: 0.2                  # Fraction of clients that are free-riders
+free_rider_strategy: "random"          # "random" (noisy) or "stale" (send global weights back)
+free_rider_noise_scale: 0.01           # Gaussian noise std for "random" strategy
+
+# Poisoning (label-flipping) attack
+poisoning_ratio: 0.2                   # Fraction of clients that poison their labels
+poisoning_strategy: "targeted"         # "targeted" (class-to-class) or "random" (random flip)
+poison_source_class: 0                 # Class whose labels are flipped (targeted mode)
+poison_target_class: 1                 # Class to flip to (targeted mode)
+poison_fraction: 0.30                  # Fraction of labels flipped (random mode)
+
+# ----- Output -----
+output_dir: "outputs"
+log_level: "INFO"

@@ -1,0 +1,45 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env/
+
+# Conda
+*.conda
+
+# Data (large files)
+data/*.csv
+data/*.npz
+data/*.pkl
+data/*.npy
+
+# Outputs (generated; keep structure, ignore files)
+outputs/**/*.png
+outputs/**/*.csv
+outputs/**/*.log
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+notebooks/.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
