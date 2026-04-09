@@ -3,6 +3,14 @@
 # 20 Newsgroups | TF-IDF + Logistic Regression (SGD)
 # =============================================================================
 
+# ----- Device -----
+# Options: "auto" | "cuda" | "mps" | "cpu"
+#   auto  → picks CUDA > MPS > CPU automatically
+#   mps   → Apple Silicon (M1/M2/M3/M4) via Metal Performance Shaders
+#   cuda  → NVIDIA GPU
+#   cpu   → force CPU on all platforms
+device: "auto"
+
 # ----- Data -----
 num_classes: 20
 max_tfidf_features: 10000     # Maximum TF-IDF vocabulary size

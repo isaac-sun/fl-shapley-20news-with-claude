@@ -43,6 +43,7 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.dirname(__file__))
 
 from src.utils        import load_config, set_seed, get_logger, experiment_output_dir
+from src.device_utils import get_device, device_info, print_device_summary
 from src.data_utils   import load_dataset
 from src.partition    import dirichlet_partition, save_client_distribution
 from src.model_utils  import set_model_params
@@ -70,6 +71,7 @@ def run_experiment(
     clients_data: List[Dict],
     output_dir: str,
     logger,
+    device=None,
 ) -> Dict:
     """
     Execute one complete FL experiment and persist all outputs.
@@ -87,9 +89,12 @@ def run_experiment(
         Dict with keys ``"round_metrics_df"`` and ``"shapley_df"`` for
         downstream comparison plotting.
     """
-    logger.info("=" * 60)
-    logger.info(f"  Starting experiment: {attack_type.upper()}")
-    logger.info("=" * 60)
+    # ------------------------------------------------------------------
+    # Resolve compute device
+    # ------------------------------------------------------------------
+    import torch
+    device = device or torch.device("cpu")
+    logger.info(f"  Device: {device}")
 
     num_clients      = cfg["num_clients"]
     num_rounds       = cfg["num_rounds"]
@@ -162,13 +167,14 @@ def run_experiment(
                 random_seed=random_seed,
                 attack_role=role,
                 attack_config=attack_config,
+                device=device,
             )
         )
 
     # ------------------------------------------------------------------
     # Initialise server
     # ------------------------------------------------------------------
-    server = FLServer(num_classes, num_features, learning_rate, random_seed)
+    server = FLServer(num_classes, num_features, learning_rate, random_seed, device=device)
 
     # ------------------------------------------------------------------
     # Accumulators
@@ -200,9 +206,8 @@ def run_experiment(
         new_global_params = server.get_global_params()
 
         # 4. Evaluate global model on validation and test sets
-        set_model_params(server._global_model, new_global_params)
-        val_metrics  = evaluate_model(server._global_model, X_val,  y_val)
-        test_metrics = evaluate_model(server._global_model, X_test, y_test)
+        val_metrics  = evaluate_model(server._global_model, X_val,  y_val,  device)
+        test_metrics = evaluate_model(server._global_model, X_test, y_test, device)
 
         round_metrics_rows.append(
             {
@@ -238,6 +243,7 @@ def run_experiment(
                     batch_size=batch_size,
                     learning_rate=learning_rate,
                     random_seed=random_seed + rnd * 1000 + cid,
+                    device=device,
                 )
 
                 for class_id, sv in sv_map.items():
@@ -374,6 +380,10 @@ def main() -> None:
         log_file=os.path.join(out_dir, "experiment.log"),
         log_level=cfg.get("log_level", "INFO"),
     )
+
+    # Detect device (CUDA / MPS / CPU)
+    device = get_device(cfg.get("device", "auto"))
+    logger.info(f"Device: {device_info(device)}")
     logger.info(f"Config: {cfg}")
 
     # ---- Load data (shared across experiments) --------------------------
@@ -408,6 +418,7 @@ def main() -> None:
         clients_data=clients_data,
         output_dir=out_dir,
         logger=logger,
+        device=device,
     )
 
     logger.info("Done.")

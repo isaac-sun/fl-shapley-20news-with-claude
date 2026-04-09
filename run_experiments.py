@@ -34,6 +34,7 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(__file__))
 
 from src.utils      import load_config, set_seed, get_logger, experiment_output_dir
+from src.device_utils import get_device, device_info
 from src.data_utils import load_dataset
 from src.partition  import dirichlet_partition, save_client_distribution
 from src.plotting   import plot_accuracy_vs_round
@@ -69,6 +70,10 @@ def main() -> None:
     logger.info("  FL SHAPLEY EXPERIMENT SUITE")
     logger.info(f"  Rounds: {cfg['num_rounds']}  |  Clients: {cfg['num_clients']}")
     logger.info("=" * 60)
+
+    # Detect device once; share across all experiments
+    device = get_device(cfg.get("device", "auto"))
+    logger.info(f"  Device: {device_info(device)}")
 
     # ---------------------------------------------------------------
     # Load data ONCE (shared across all three experiments)
@@ -129,6 +134,7 @@ def main() -> None:
             clients_data=clients_data,
             output_dir=out_dir,
             logger=logger,
+            device=device,
         )
         elapsed = time.time() - t_start
         logger.info(f"  Finished {attack} in {elapsed:.1f}s")

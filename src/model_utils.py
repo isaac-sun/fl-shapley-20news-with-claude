@@ -1,36 +1,64 @@
 """
 src/model_utils.py
 ==================
-Thin wrappers around scikit-learn's SGDClassifier for use in federated
-learning.
+PyTorch-based logistic regression model for federated learning.
 
-Why SGDClassifier?
-------------------
-* ``partial_fit`` allows incremental / mini-batch training – directly
-  analogous to one local SGD step per communication round.
-* The model parameters (``coef_``, ``intercept_``) are plain NumPy arrays
-  that can be averaged across clients (FedAvg).
-* With ``loss='log_loss'`` the model is logistic regression, which is
-  simple, interpretable, and unlikely to converge instantly on 20 NewsGroups,
-  making it ideal for observing the effect of attacks over many rounds.
+Device support
+--------------
+* CPU   – all platforms (default fallback)
+* CUDA  – NVIDIA GPUs (Linux / Windows)
+* MPS   – Apple Silicon M-series chips via Metal Performance Shaders
 
-Initialization trick
---------------------
-sklearn's SGDClassifier sets many internal attributes lazily on the first
-``partial_fit`` call.  We trigger that initialization with a tiny dummy
-dataset, then reset ``coef_`` and ``intercept_`` to zero so the model
-effectively starts from scratch (or from whatever params we inject via
-:func:`set_model_params`).
+Why PyTorch instead of sklearn SGDClassifier?
+---------------------------------------------
+sklearn's SGDClassifier is CPU-only.  By reimplementing the same model
+(linear layer + cross-entropy loss + SGD) in PyTorch we get transparent
+GPU/MPS acceleration with a minimal code change.
+
+MPS constraints (Apple Silicon)
+--------------------------------
+* float64 tensors are **not** supported on MPS → all tensors use float32.
+* Sparse tensor ops are not supported on MPS → dense conversion happens
+  inside :func:`sparse_to_tensor` before any data touches the device.
+
+Parameter interface
+-------------------
+:func:`get_model_params` / :func:`set_model_params` always use float64
+NumPy arrays so that FedAvg aggregation (CPU numpy) stays device-independent
+and the parameter format is identical to the original sklearn version.
 """
 
 from __future__ import annotations
 
-import copy
 from typing import Dict, List
 
 import numpy as np
-from scipy.sparse import csr_matrix
-from sklearn.linear_model import SGDClassifier
+import torch
+import torch.nn as nn
+from scipy.sparse import issparse
+
+
+# ---------------------------------------------------------------------------
+# Model definition
+# ---------------------------------------------------------------------------
+
+class TorchLRModel(nn.Module):
+    """
+    Single-layer logistic regression:  scores = X @ W.T + b
+
+    Equivalent to sklearn's ``SGDClassifier(loss='log_loss')`` but
+    runs on any torch.device (CPU / CUDA / MPS).
+    """
+
+    def __init__(self, num_classes: int, num_features: int) -> None:
+        super().__init__()
+        self.linear = nn.Linear(num_features, num_classes, bias=True)
+        # Zero init so rounds start from the same global params
+        nn.init.zeros_(self.linear.weight)
+        nn.init.zeros_(self.linear.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.linear(x)
 
 
 # ---------------------------------------------------------------------------
@@ -40,114 +68,189 @@ from sklearn.linear_model import SGDClassifier
 def create_model(
     num_classes: int,
     num_features: int,
-    learning_rate: float = 0.01,
+    learning_rate: float = 0.01,      # kept for API compatibility
+    device: torch.device | None = None,
     random_seed: int = 42,
-) -> SGDClassifier:
+) -> TorchLRModel:
     """
-    Create a fully-initialized SGDClassifier (logistic regression).
-
-    The model is initialised by calling ``partial_fit`` once on a tiny dummy
-    dataset.  This ensures all sklearn internal attributes are present before
-    we start injecting arbitrary parameter dicts.  The weights are then reset
-    to zero.
+    Create a zero-initialised :class:`TorchLRModel` on *device*.
 
     Args:
         num_classes:   Number of output classes (20 for 20 Newsgroups).
-        num_features:  TF-IDF feature dimension.
-        learning_rate: Constant SGD step size.
-        random_seed:   Seed for weight initialisation.
+        num_features:  TF-IDF vocabulary dimension.
+        learning_rate: Not used here; consumed by :func:`train_on_data`.
+        device:        Target torch device.  Defaults to CPU.
+        random_seed:   Seed for any internal random ops.
 
     Returns:
-        Initialised ``SGDClassifier`` with zero weights.
+        Initialised :class:`TorchLRModel` with all-zero weights.
     """
-    rng = np.random.RandomState(random_seed)
-
-    model = SGDClassifier(
-        loss="log_loss",
-        learning_rate="constant",  # constant LR → predictable FL dynamics
-        eta0=learning_rate,
-        fit_intercept=True,
-        tol=None,                  # disable convergence stopping
-        max_iter=1,                # we drive epochs ourselves via partial_fit
-        warm_start=False,
-        random_state=random_seed,
-        n_jobs=1,
-    )
-
-    # --- Trigger sklearn lazy initialization --------------------------------
-    # Use small non-zero values so log-loss gradient is well-defined.
-    dummy_X = csr_matrix(
-        rng.rand(num_classes, num_features).astype(np.float32) * 0.1
-    )
-    dummy_y = np.arange(num_classes, dtype=int)
-    model.partial_fit(dummy_X, dummy_y, classes=dummy_y)
-
-    # Reset weights to zero after the dummy pass
-    model.coef_      = np.zeros((num_classes, num_features), dtype=np.float64)
-    model.intercept_ = np.zeros(num_classes, dtype=np.float64)
-
+    if device is None:
+        device = torch.device("cpu")
+    torch.manual_seed(random_seed)
+    model = TorchLRModel(num_classes, num_features).to(device)
     return model
 
 
 # ---------------------------------------------------------------------------
-# Parameter serialization helpers
+# Parameter serialization
 # ---------------------------------------------------------------------------
 
-def get_model_params(model: SGDClassifier) -> Dict[str, np.ndarray]:
+def get_model_params(model: TorchLRModel) -> Dict[str, np.ndarray]:
     """
-    Return a **copy** of the model's trainable parameters.
+    Return a **copy** of model weights as float64 NumPy arrays.
 
     Returns:
         ``{"coef": ndarray(num_classes, num_features),
            "intercept": ndarray(num_classes)}``
     """
     return {
-        "coef":      model.coef_.copy().astype(np.float64),
-        "intercept": model.intercept_.copy().astype(np.float64),
+        "coef":      model.linear.weight.detach().cpu().numpy().astype(np.float64),
+        "intercept": model.linear.bias.detach().cpu().numpy().astype(np.float64),
     }
 
 
 def set_model_params(
-    model: SGDClassifier,
+    model: TorchLRModel,
     params: Dict[str, np.ndarray],
-) -> SGDClassifier:
+    device: torch.device | None = None,
+) -> TorchLRModel:
     """
-    Overwrite ``model.coef_`` and ``model.intercept_`` in-place.
+    Load NumPy parameter arrays into *model* in-place (no grad).
 
     Args:
-        model:  An already-initialised SGDClassifier.
+        model:  Already-created :class:`TorchLRModel`.
         params: Dict with keys ``"coef"`` and ``"intercept"``.
+        device: Device to move tensors to (uses model's current device if None).
 
     Returns:
-        The same ``model`` object (mutated in-place).
+        The same *model* object (mutated).
     """
-    model.coef_      = params["coef"].astype(np.float64).copy()
-    model.intercept_ = params["intercept"].astype(np.float64).copy()
+    dev = device or next(model.parameters()).device
+    with torch.no_grad():
+        model.linear.weight.copy_(
+            torch.tensor(params["coef"], dtype=torch.float32, device=dev)
+        )
+        model.linear.bias.copy_(
+            torch.tensor(params["intercept"], dtype=torch.float32, device=dev)
+        )
     return model
 
 
 def clone_model(
-    model: SGDClassifier,
+    model: TorchLRModel,
+    device: torch.device | None = None,
     params: Dict[str, np.ndarray] | None = None,
-) -> SGDClassifier:
+) -> TorchLRModel:
     """
-    Deep-copy *model* and optionally inject new *params*.
+    Create a new :class:`TorchLRModel` with the same architecture as *model*
+    and optionally load *params* into it.
 
     Args:
-        model:  Source model.
-        params: If given, replaces the cloned model's parameters.
+        model:   Source model (used for shape inference).
+        device:  Target device for the clone.
+        params:  If given, replaces source model's parameters in the clone.
 
     Returns:
-        A new ``SGDClassifier`` independent of the original.
+        Independent :class:`TorchLRModel`.
     """
-    new_model = copy.deepcopy(model)
-    if params is not None:
-        set_model_params(new_model, params)
+    dev = device or next(model.parameters()).device
+    nc = model.linear.out_features
+    nf = model.linear.in_features
+    new_model = TorchLRModel(nc, nf).to(dev)
+    src_params = params if params is not None else get_model_params(model)
+    set_model_params(new_model, src_params, dev)
     return new_model
 
 
 # ---------------------------------------------------------------------------
-# FedAvg aggregation
+# Sparse → Tensor conversion  (MPS / CUDA safe)
+# ---------------------------------------------------------------------------
+
+def sparse_to_tensor(X, device: torch.device) -> torch.Tensor:
+    """
+    Convert a scipy sparse matrix (or numpy array) to a float32 torch Tensor.
+
+    The dense conversion always happens on CPU first, then the tensor is
+    moved to *device*.  This is required because MPS and CUDA do not support
+    sparse tensor operations.
+
+    Args:
+        X:       scipy sparse matrix or numpy array  (n_samples × n_features).
+        device:  Target device.
+
+    Returns:
+        float32 Tensor of shape (n_samples, n_features) on *device*.
+    """
+    if issparse(X):
+        arr = X.toarray().astype(np.float32)
+    else:
+        arr = np.asarray(X, dtype=np.float32)
+    # torch.from_numpy shares memory; .to(device) copies to GPU/MPS if needed
+    return torch.from_numpy(arr).to(device)
+
+
+# ---------------------------------------------------------------------------
+# Local training
+# ---------------------------------------------------------------------------
+
+def train_on_data(
+    model: TorchLRModel,
+    X,
+    y: np.ndarray,
+    num_classes: int,           # kept for API compatibility
+    local_epochs: int,
+    batch_size: int,
+    learning_rate: float,
+    device: torch.device | None = None,
+    random_seed: int = 42,
+) -> TorchLRModel:
+    """
+    Run *local_epochs* passes of mini-batch SGD on *(X, y)*.
+
+    Equivalent to the previous sklearn ``partial_fit`` loop, but accelerated
+    by PyTorch on CUDA / MPS.
+
+    Args:
+        model:         :class:`TorchLRModel` pre-loaded with global params.
+        X:             Sparse feature matrix  (n_samples × n_features).
+        y:             Integer label array    (n_samples,).
+        num_classes:   Unused; kept for call-site compatibility.
+        local_epochs:  Number of full passes over the local dataset.
+        batch_size:    Mini-batch size.
+        learning_rate: SGD step size.
+        device:        Inference device; falls back to model's current device.
+        random_seed:   Seed for mini-batch shuffling.
+
+    Returns:
+        The updated *model* (same object, parameters modified in-place).
+    """
+    n = X.shape[0]
+    if n == 0:
+        return model
+
+    dev = device or next(model.parameters()).device
+    model.train()
+    optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate)
+    criterion = nn.CrossEntropyLoss()
+    rng = np.random.RandomState(random_seed)
+
+    for _ in range(local_epochs):
+        order = rng.permutation(n)
+        for start in range(0, n, batch_size):
+            idx = order[start : start + batch_size]
+            X_b = sparse_to_tensor(X[idx], dev)
+            y_b = torch.tensor(y[idx], dtype=torch.long, device=dev)
+            optimizer.zero_grad()
+            loss = criterion(model(X_b), y_b)
+            loss.backward()
+            optimizer.step()
+
+    return model
+
+
+# ---------------------------------------------------------------------------
+# FedAvg aggregation  (always CPU / numpy)
 # ---------------------------------------------------------------------------
 
 def fedavg_aggregate(
@@ -155,17 +258,18 @@ def fedavg_aggregate(
     client_weights: List[float],
 ) -> Dict[str, np.ndarray]:
     """
-    Federated Averaging: compute a weighted mean of client parameters.
+    Federated Averaging: weighted mean of client parameter dicts.
 
-    The weight for each client is proportional to its number of local
-    training samples (standard FedAvg as in McMahan et al. 2017).
+    Aggregation always runs on CPU with NumPy so it is device-agnostic.
+    The weight for each client is proportional to its local sample count
+    (standard FedAvg, McMahan et al. 2017).
 
     Args:
         client_params_list: List of ``{"coef": …, "intercept": …}`` dicts.
-        client_weights:     Corresponding non-negative weights (sample counts).
+        client_weights:     Corresponding sample counts (FedAvg weights).
 
     Returns:
-        Aggregated parameter dict with same structure as inputs.
+        Aggregated parameter dict.
     """
     total = float(sum(client_weights))
     if total == 0.0:
@@ -184,53 +288,3 @@ def fedavg_aggregate(
         avg_intercept += frac * params["intercept"]
 
     return {"coef": avg_coef, "intercept": avg_intercept}
-
-
-# ---------------------------------------------------------------------------
-# Local training
-# ---------------------------------------------------------------------------
-
-def train_on_data(
-    model: SGDClassifier,
-    X: csr_matrix,
-    y: np.ndarray,
-    num_classes: int,
-    local_epochs: int,
-    batch_size: int,
-    random_seed: int = 42,
-) -> SGDClassifier:
-    """
-    Run ``local_epochs`` passes of mini-batch SGD on ``(X, y)``.
-
-    ``partial_fit`` is called once per mini-batch so that the model
-    parameters are updated incrementally (exactly as in standard SGD-based
-    federated learning).  The ``classes`` argument is always the full set
-    ``[0, …, num_classes-1]`` so that ``coef_`` keeps its original shape
-    even when a batch contains only a subset of classes.
-
-    Args:
-        model:        SGDClassifier initialised with current (global) params.
-        X:            Sparse feature matrix for this client.
-        y:            Label array for this client.
-        num_classes:  Total number of classes in the problem.
-        local_epochs: Number of full passes over ``(X, y)``.
-        batch_size:   Mini-batch size.
-        random_seed:  Seed for per-epoch shuffling.
-
-    Returns:
-        The updated model (same object, mutated in-place).
-    """
-    n = X.shape[0]
-    if n == 0:
-        return model
-
-    all_classes = np.arange(num_classes, dtype=int)
-    rng = np.random.RandomState(random_seed)
-
-    for _ in range(local_epochs):
-        order = rng.permutation(n)
-        for start in range(0, n, batch_size):
-            idx = order[start : start + batch_size]
-            model.partial_fit(X[idx], y[idx], classes=all_classes)
-
-    return model
